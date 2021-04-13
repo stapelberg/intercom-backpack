@@ -9,6 +9,7 @@
 #define GPIO_DOOR_OPEN 27
 #define GPIO_NUKI_YELLOW 14
 #define GPIO_NUKI_BLUE 15
+#define GPIO_FLOOR_RING 4
 
 void nukiRing(void *pvParameters);
 
@@ -91,6 +92,7 @@ void taskscsprocess(void *pvParameters) {
     Serial.println("mqtt publish");
 
     if (sf_ringForApartment(&sf) == 3) {
+      client.publish("doorbell/events/ring", "house");
       Serial.println("ring detected, triggering nuki opener");
       xTaskCreatePinnedToCore(nukiRing, "nukiRing", 2048, NULL, 1, NULL,
                               PRO_CPU_NUM);
@@ -126,6 +128,7 @@ void nukiRing(void *pvParameters) {
   digitalWrite(GPIO_NUKI_YELLOW, HIGH);
   vTaskDelay(pdMS_TO_TICKS(1000));
   digitalWrite(GPIO_NUKI_YELLOW, LOW);
+  client.publish("doorbell/debug/nukiring", "ring");
   vTaskDelete(NULL);
 }
 
@@ -134,6 +137,7 @@ void doorUnlock(void *pvParameters) {
   digitalWrite(GPIO_DOOR_OPEN, LOW);
   vTaskDelay(pdMS_TO_TICKS(500));
   digitalWrite(GPIO_DOOR_OPEN, HIGH);
+  client.publish("doorbell/debug/doorunlock", "doorunlock");
   vTaskDelete(NULL);
 }
 
@@ -174,6 +178,72 @@ void setupnuki(void) {
   // pin GPIO_NUKI_BLUE: connected to nuki opener blue cable (OPEN)
   pinMode(GPIO_NUKI_BLUE, INPUT_PULLUP);
   xTaskCreatePinnedToCore(setupnuki0, "setupnuki0", 2048, NULL, 1, NULL,
+                          PRO_CPU_NUM);
+}
+
+// --------------------------------------------------------------------------------
+
+void floorRingNuki(void *pvParameters) {
+  Serial.printf("[core %d] floorRing\n", xPortGetCoreID());
+  client.publish("doorbell/events/ring", "floor");
+  const byte state = digitalRead(GPIO_FLOOR_RING);
+  digitalWrite(GPIO_NUKI_YELLOW, HIGH);
+  vTaskDelay(pdMS_TO_TICKS(1000));
+  digitalWrite(GPIO_NUKI_YELLOW, LOW);
+  client.publish("doorbell/debug/floorring", state == LOW ? "low" : "high");
+  vTaskDelete(NULL);
+}
+
+SemaphoreHandle_t xFloorOpenSemaphore = NULL;
+
+// IRAM_ATTR: all interrupt service routines must go into the internal SRAM:
+// https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/general-notes.html#iram-instruction-ram
+void IRAM_ATTR floorRing() { xSemaphoreGiveFromISR(xFloorOpenSemaphore, NULL); }
+
+static byte floorRingState = LOW;
+static unsigned long lastFloorRing;
+
+// setupfloor0 is the part of the setup routine that needs to run on core 0, so
+// that the interrupt handler will also run on core 0:
+// https://rntlab.com/question/esp32-designating-a-specific-core-for-specific-interrupt-service/
+void setupfloor0(void *pvParameters) {
+  attachInterrupt(GPIO_FLOOR_RING, floorRing, RISING);
+  for (;;) {
+    if (xSemaphoreTake(xFloorOpenSemaphore, portMAX_DELAY) != pdTRUE) {
+      continue;
+    }
+    if (floorRingState == LOW && (millis() - lastFloorRing) < 1000) {
+      continue; // debounce by waiting it out
+    }
+
+    const byte state = digitalRead(GPIO_FLOOR_RING);
+    Serial.printf("GPIO_FLOOR_RING was %s\n",
+                  floorRingState == LOW ? "low" : "high");
+    Serial.printf("GPIO_FLOOR_RING is %s\n", state == LOW ? "low" : "high");
+    Serial.printf("\n");
+    if (floorRingState == LOW && state == HIGH) {
+      // debounce: wait if HIGH after 100ms still
+      vTaskDelay(pdMS_TO_TICKS(100));
+      const byte debouncedstate = digitalRead(GPIO_FLOOR_RING);
+      Serial.printf("debouncedstate is %s\n",
+                    debouncedstate == LOW ? "low" : "high");
+      if (debouncedstate != HIGH) {
+        continue; // too short a press, or spurious
+      }
+      xTaskCreatePinnedToCore(floorRingNuki, "floorRingNuki", 2048, NULL, 1,
+                              NULL, PRO_CPU_NUM);
+      lastFloorRing = millis();
+    }
+    floorRingState = state;
+  }
+}
+
+void setupfloor(void) {
+  xFloorOpenSemaphore = xSemaphoreCreateBinary();
+
+  // pin GPIO_FLOOR_RING: connected to floor ring signal
+  pinMode(GPIO_FLOOR_RING, INPUT);
+  xTaskCreatePinnedToCore(setupfloor0, "setupfloor0", 2048, NULL, 1, NULL,
                           PRO_CPU_NUM);
 }
 
@@ -264,6 +334,7 @@ void setup() {
   digitalWrite(GPIO_DOOR_OPEN, HIGH);
 
   setupnuki();
+  setupfloor();
 
   // setup UART2 (U2UXD) on GPIO pin 25 (RX)
   Serial2.begin(9600, SERIAL_8N1, 25, 26);
