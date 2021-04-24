@@ -242,7 +242,7 @@ void setupfloor(void) {
   xFloorOpenSemaphore = xSemaphoreCreateBinary();
 
   // pin GPIO_FLOOR_RING: connected to floor ring signal
-  pinMode(GPIO_FLOOR_RING, INPUT);
+  pinMode(GPIO_FLOOR_RING, INPUT_PULLDOWN);
   xTaskCreatePinnedToCore(setupfloor0, "setupfloor0", 2048, NULL, 1, NULL,
                           PRO_CPU_NUM);
 }
