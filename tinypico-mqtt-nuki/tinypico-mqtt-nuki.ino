@@ -115,7 +115,7 @@ void taskscsprocess(void *pvParameters) {
     if (sf_ringForApartment(&sf) == 3) {
       mqttPublish("doorbell/events/ring", "house");
       Serial.println("ring detected, triggering nuki opener");
-      xTaskCreatePinnedToCore(nukiRing, "nukiRing", 2048, NULL, 1, NULL,
+      xTaskCreatePinnedToCore(nukiRing, "nukiRing", 4096, NULL, 1, NULL,
                               PRO_CPU_NUM);
     }
   }
@@ -189,7 +189,7 @@ void setupnuki0(void *pvParameters) {
       continue;
     }
 
-    xTaskCreatePinnedToCore(doorUnlock, "doorUnlock", 2048, NULL, 1, NULL,
+    xTaskCreatePinnedToCore(doorUnlock, "doorUnlock", 4096, NULL, 1, NULL,
                             PRO_CPU_NUM);
   }
 }
@@ -203,7 +203,7 @@ void setupnuki(void) {
 
   // pin GPIO_NUKI_BLUE: connected to nuki opener blue cable (OPEN)
   pinMode(GPIO_NUKI_BLUE, INPUT_PULLUP);
-  xTaskCreatePinnedToCore(setupnuki0, "setupnuki0", 2048, NULL, 1, NULL,
+  xTaskCreatePinnedToCore(setupnuki0, "setupnuki0", 4096, NULL, 1, NULL,
                           PRO_CPU_NUM);
 }
 
@@ -261,7 +261,7 @@ void setupfloor0(void *pvParameters) {
       if (debouncedstate != HIGH) {
         continue; // too short a press, or spurious
       }
-      xTaskCreatePinnedToCore(floorRingNuki, "floorRingNuki", 2048, NULL, 1,
+      xTaskCreatePinnedToCore(floorRingNuki, "floorRingNuki", 4096, NULL, 1,
                               NULL, PRO_CPU_NUM);
       lastFloorRing = millis();
     }
@@ -274,7 +274,7 @@ void setupfloor(void) {
 
   // pin GPIO_FLOOR_RING: connected to floor ring signal
   pinMode(GPIO_FLOOR_RING, INPUT_PULLDOWN);
-  xTaskCreatePinnedToCore(setupfloor0, "setupfloor0", 2048, NULL, 1, NULL,
+  xTaskCreatePinnedToCore(setupfloor0, "setupfloor0", 4096, NULL, 1, NULL,
                           PRO_CPU_NUM);
 }
 
@@ -290,12 +290,12 @@ void callback(char *topic, byte *payload, unsigned int length) {
   Serial.println();
 
   if (strcmp(topic, "doorbell/cmd/unlock") == 0) {
-    xTaskCreatePinnedToCore(doorUnlock, "doorUnlock", 2048, NULL, 1, NULL,
+    xTaskCreatePinnedToCore(doorUnlock, "doorUnlock", 4096, NULL, 1, NULL,
                             PRO_CPU_NUM);
   }
 
   if (strcmp(topic, "doorbell/debug/cmd/ring") == 0) {
-    xTaskCreatePinnedToCore(nukiRing, "nukiRing", 2048, NULL, 1, NULL,
+    xTaskCreatePinnedToCore(nukiRing, "nukiRing", 4096, NULL, 1, NULL,
                             PRO_CPU_NUM);
   }
 
@@ -407,14 +407,19 @@ void setup() {
   // conversion:
   disableCore1WDT();
 
-  xTaskCreatePinnedToCore(taskscsprocess, "SCS", 2048, NULL, 1, NULL,
+  // Stack sizes were 2048 in the arduino-esp32 1.0.4 era, but 2.0.17's
+  // runtime (attachInterrupt, WiFi/MQTT call paths) uses considerably
+  // more stack — 2048 trips the stack canary in setupfloor0 within
+  // seconds of WiFi connect. 4096 is the safe minimum; taskmqtt gets
+  // 8192 since callback() runs on its stack during client.loop().
+  xTaskCreatePinnedToCore(taskscsprocess, "SCS", 4096, NULL, 1, NULL,
                           PRO_CPU_NUM);
 
-  xTaskCreatePinnedToCore(taskmqtt, "MQTT", 2048, NULL, 1, NULL, PRO_CPU_NUM);
+  xTaskCreatePinnedToCore(taskmqtt, "MQTT", 8192, NULL, 1, NULL, PRO_CPU_NUM);
 
-  xTaskCreatePinnedToCore(taskalive, "Alive", 2048, NULL, 1, NULL, PRO_CPU_NUM);
+  xTaskCreatePinnedToCore(taskalive, "Alive", 4096, NULL, 1, NULL, PRO_CPU_NUM);
 
-  xTaskCreatePinnedToCore(taskreconnect, "reconnect", 2048, NULL, 1, NULL,
+  xTaskCreatePinnedToCore(taskreconnect, "reconnect", 4096, NULL, 1, NULL,
                           PRO_CPU_NUM);
 }
 
