@@ -173,11 +173,9 @@ SemaphoreHandle_t xNukiOpenSemaphore = NULL;
 // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/general-notes.html#iram-instruction-ram
 void IRAM_ATTR nukiOpen() { xSemaphoreGiveFromISR(xNukiOpenSemaphore, NULL); }
 
-// setupnuki0 is the part of the setup routine that needs to run on core 0, so
-// that the interrupt handler will also run on core 0:
-// https://rntlab.com/question/esp32-designating-a-specific-core-for-specific-interrupt-service/
+// setupnuki0 runs the wakeup loop. It is pinned to PRO_CPU so the handler
+// task is on the same core as the original interrupt-handling design.
 void setupnuki0(void *pvParameters) {
-  attachInterrupt(GPIO_NUKI_BLUE, nukiOpen, FALLING);
   for (;;) {
     if (xSemaphoreTake(xNukiOpenSemaphore, portMAX_DELAY) != pdTRUE) {
       continue;
@@ -203,6 +201,10 @@ void setupnuki(void) {
 
   // pin GPIO_NUKI_BLUE: connected to nuki opener blue cable (OPEN)
   pinMode(GPIO_NUKI_BLUE, INPUT_PULLUP);
+  // attachInterrupt must run before the loop tasks start: arduino-esp32 2.x
+  // crashes (LoadProhibited in esp_intr_get_cpu) if two tasks race to call
+  // attachInterrupt for the first time. setup() serializes it.
+  attachInterrupt(GPIO_NUKI_BLUE, nukiOpen, FALLING);
   xTaskCreatePinnedToCore(setupnuki0, "setupnuki0", 4096, NULL, 1, NULL,
                           PRO_CPU_NUM);
 }
@@ -234,11 +236,9 @@ void IRAM_ATTR floorRing() { xSemaphoreGiveFromISR(xFloorOpenSemaphore, NULL); }
 static byte floorRingState = LOW;
 static unsigned long lastFloorRing;
 
-// setupfloor0 is the part of the setup routine that needs to run on core 0, so
-// that the interrupt handler will also run on core 0:
-// https://rntlab.com/question/esp32-designating-a-specific-core-for-specific-interrupt-service/
+// setupfloor0 runs the wakeup loop. attachInterrupt was already called from
+// setupfloor() on the main task to avoid the arduino-esp32 2.x race.
 void setupfloor0(void *pvParameters) {
-  attachInterrupt(GPIO_FLOOR_RING, floorRing, RISING);
   for (;;) {
     if (xSemaphoreTake(xFloorOpenSemaphore, portMAX_DELAY) != pdTRUE) {
       continue;
@@ -274,6 +274,7 @@ void setupfloor(void) {
 
   // pin GPIO_FLOOR_RING: connected to floor ring signal
   pinMode(GPIO_FLOOR_RING, INPUT_PULLDOWN);
+  attachInterrupt(GPIO_FLOOR_RING, floorRing, RISING);
   xTaskCreatePinnedToCore(setupfloor0, "setupfloor0", 4096, NULL, 1, NULL,
                           PRO_CPU_NUM);
 }
