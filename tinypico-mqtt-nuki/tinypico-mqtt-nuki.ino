@@ -405,7 +405,11 @@ void setup() {
   //
   // arduino-esp32 defaults to using APP_CPU for loop() and WiFi onEvent
   // callbacks. We leave loop() empty and use APP_CPU entirely for SCS ADC
-  // conversion:
+  // conversion. Disable the IDLE-task watchdog on both cores: arduino-esp32
+  // 2.x enforces it by default, and our PRO_CPU-pinned MQTT task can spend
+  // multiple seconds inside PubSubClient::connect() during reconnects,
+  // starving IDLE0 and tripping the watchdog.
+  disableCore0WDT();
   disableCore1WDT();
 
   // Stack sizes were 2048 in the arduino-esp32 1.0.4 era, but 2.0.17's
