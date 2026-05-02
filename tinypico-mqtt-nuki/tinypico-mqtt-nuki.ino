@@ -16,6 +16,22 @@ void nukiRing(void *pvParameters);
 WiFiClient wificlient;
 PubSubClient client(wificlient);
 
+// PubSubClient is not thread-safe. All client.publish/connect/loop calls go
+// through this mutex; publishers from other tasks use mqttPublish below.
+static SemaphoreHandle_t xMqttMutex = NULL;
+
+static bool mqttPublish(const char *topic, const char *payload,
+                        bool retained = false) {
+  if (xSemaphoreTake(xMqttMutex, pdMS_TO_TICKS(200)) != pdTRUE) return false;
+  bool ok = client.publish(topic, payload, retained);
+  xSemaphoreGive(xMqttMutex);
+  return ok;
+}
+
+// silentMode suppresses the nuki opener auto-trigger from ring events.
+// Toggled via retained MQTT topic doorbell/silent ("on"/"off").
+static volatile bool silentMode = false;
+
 // TODO: give this a constructor or something
 scsfilter sf;
 
@@ -40,7 +56,6 @@ void taskscsprocess(void *pvParameters) {
     byte incomingByte = Serial2.read();
     Serial.printf("[core %d] SCSRX: ", xPortGetCoreID());
     Serial.println(incomingByte, HEX);
-    client.publish("doorbell/debug/scsrx", &incomingByte, 1);
 
     // We store the checksum of telegrams to ignore, so that different
     // messages are not accidentally ignored by the quiet timer.
@@ -87,12 +102,18 @@ void taskscsprocess(void *pvParameters) {
       }
     }
 
-    // Publish an MQTT message for each SCS telegram:
-    client.publish("doorbell/events/scs", sf.tbuf, telegramLen);
+    // Publish an MQTT message for each SCS telegram, hex-encoded so bytes
+    // >=0x80 survive UTF-8-decoding MQTT subscribers (mosquitto_sub -v etc).
+    char hex[3 * telegramLen];
+    snprintf(hex, sizeof(hex),
+             "%02x %02x %02x %02x %02x %02x %02x",
+             sf.tbuf[0], sf.tbuf[1], sf.tbuf[2], sf.tbuf[3],
+             sf.tbuf[4], sf.tbuf[5], sf.tbuf[6]);
+    mqttPublish("doorbell/events/scs", hex);
     Serial.println("mqtt publish");
 
     if (sf_ringForApartment(&sf) == 3) {
-      client.publish("doorbell/events/ring", "house");
+      mqttPublish("doorbell/events/ring", "house");
       Serial.println("ring detected, triggering nuki opener");
       xTaskCreatePinnedToCore(nukiRing, "nukiRing", 2048, NULL, 1, NULL,
                               PRO_CPU_NUM);
@@ -125,10 +146,15 @@ void connectToWiFi(void) {
 
 void nukiRing(void *pvParameters) {
   Serial.printf("[core %d] nukiRing\n", xPortGetCoreID());
+  if (silentMode) {
+    mqttPublish("doorbell/debug/suppressed", "nukiRing");
+    vTaskDelete(NULL);
+    return;
+  }
   digitalWrite(GPIO_NUKI_YELLOW, HIGH);
   vTaskDelay(pdMS_TO_TICKS(1000));
   digitalWrite(GPIO_NUKI_YELLOW, LOW);
-  client.publish("doorbell/debug/nukiring", "ring");
+  mqttPublish("doorbell/debug/nukiring", "ring");
   vTaskDelete(NULL);
 }
 
@@ -137,7 +163,7 @@ void doorUnlock(void *pvParameters) {
   digitalWrite(GPIO_DOOR_OPEN, LOW);
   vTaskDelay(pdMS_TO_TICKS(500));
   digitalWrite(GPIO_DOOR_OPEN, HIGH);
-  client.publish("doorbell/debug/doorunlock", "doorunlock");
+  mqttPublish("doorbell/debug/doorunlock", "doorunlock");
   vTaskDelete(NULL);
 }
 
@@ -185,12 +211,17 @@ void setupnuki(void) {
 
 void floorRingNuki(void *pvParameters) {
   Serial.printf("[core %d] floorRing\n", xPortGetCoreID());
-  client.publish("doorbell/events/ring", "floor");
+  mqttPublish("doorbell/events/ring", "floor");
+  if (silentMode) {
+    mqttPublish("doorbell/debug/suppressed", "floorRingNuki");
+    vTaskDelete(NULL);
+    return;
+  }
   const byte state = digitalRead(GPIO_FLOOR_RING);
   digitalWrite(GPIO_NUKI_YELLOW, HIGH);
   vTaskDelay(pdMS_TO_TICKS(1000));
   digitalWrite(GPIO_NUKI_YELLOW, LOW);
-  client.publish("doorbell/debug/floorring", state == LOW ? "low" : "high");
+  mqttPublish("doorbell/debug/floorring", state == LOW ? "low" : "high");
   vTaskDelete(NULL);
 }
 
@@ -267,17 +298,36 @@ void callback(char *topic, byte *payload, unsigned int length) {
     xTaskCreatePinnedToCore(nukiRing, "nukiRing", 2048, NULL, 1, NULL,
                             PRO_CPU_NUM);
   }
+
+  if (strcmp(topic, "doorbell/silent") == 0) {
+    // payload is not NUL-terminated; compare with length.
+    bool newMode =
+        (length == 2 && payload[0] == 'o' && payload[1] == 'n');
+    silentMode = newMode;
+    Serial.printf("silentMode = %d\n", newMode ? 1 : 0);
+    // We are inside client.loop(), which taskmqtt called while holding
+    // xMqttMutex — use the raw publish (not mqttPublish) to avoid the
+    // wrapper's redundant take-with-timeout.
+    client.publish("doorbell/silent_state", newMode ? "on" : "off",
+                   /* retained */ true);
+  }
 }
 
 void taskmqtt(void *pvParameters) {
   for (;;) {
+    xSemaphoreTake(xMqttMutex, portMAX_DELAY);
     if (!client.connected()) {
       // TODO: do we need a timeout here? does client.connect only block the
       // taskmqtt FreeRTOS task, or all FreeRTOS tasks on this core?
-      client.connect("doorbelltp" /* clientid */);
-      client.publish("doorbell/presence", "fresh from logon");
+      client.connect("doorbelltp",     // clientid
+                     "doorbell/status", // willTopic
+                     0,                 // willQos
+                     true,              // willRetain
+                     "offline");        // willMessage
+      client.publish("doorbell/status", "online", /* retained */ true);
       client.subscribe("doorbell/cmd/unlock");
       client.subscribe("doorbell/debug/cmd/ring");
+      client.subscribe("doorbell/silent");
     }
 
     // Poll PubSubClient for new messages and invoke the callback.
@@ -287,6 +337,7 @@ void taskmqtt(void *pvParameters) {
     // the network hardware:
     // https://github.com/knolleary/pubsubclient/issues/756#issuecomment-654335096
     client.loop();
+    xSemaphoreGive(xMqttMutex);
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
@@ -295,8 +346,14 @@ void taskmqtt(void *pvParameters) {
 
 void taskalive(void *pvParameters) {
   for (;;) {
-    Serial.printf("still running\n");
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    char buf[96];
+    snprintf(buf, sizeof(buf),
+             "{\"uptime_s\":%lu,\"rssi\":%d,\"silent\":%s}",
+             (unsigned long)(millis() / 1000),
+             (int)WiFi.RSSI(),
+             silentMode ? "true" : "false");
+    mqttPublish("doorbell/heartbeat", buf);
+    vTaskDelay(pdMS_TO_TICKS(60000));
   }
 }
 
@@ -327,7 +384,9 @@ void setup() {
 
   connectToWiFi();
 
-  client.setServer("dr.lan", 1883);
+  xMqttMutex = xSemaphoreCreateMutex();
+
+  client.setServer("mqtt.lan", 1883);
   client.setCallback(callback);
 
   pinMode(GPIO_DOOR_OPEN, OUTPUT);
